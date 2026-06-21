@@ -2,7 +2,7 @@
 // Find The Imposter + Draw The Imposter
 // All bugs fixed, Game 2 implemented, comprehensive word banks
 
-import { useState, useEffect, useRef, useCallback } from "react"
+import { useState, useEffect, useRef, useCallback, Component, type ReactNode } from "react"
 import { motion, AnimatePresence } from "motion/react"
 import { clsx } from "clsx"
 import { twMerge } from "tailwind-merge"
@@ -136,6 +136,43 @@ function doCopy(text: string): boolean {
   } catch { return false }
 }
 
+// ─── ERROR BOUNDARY ───────────────────────────────────────────────────────────
+// Catches any runtime crash so users see a helpful message instead of a white screen.
+
+class ErrorBoundary extends Component<{ children: ReactNode }, { error: string | null }> {
+  state = { error: null }
+  static getDerivedStateFromError(err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err)
+    return { error: msg }
+  }
+  componentDidCatch(err: unknown) {
+    console.error("[PlayGioco] Uncaught error:", err)
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="min-h-screen bg-[#F8F8F8] flex flex-col items-center justify-center p-8 font-['Inter',_sans-serif]">
+          <div className="max-w-md w-full text-center">
+            <div className="font-['Geist',_sans-serif] font-black text-[80px] text-secondary leading-none mb-4">!</div>
+            <h2 className="font-['Geist',_sans-serif] font-black text-2xl mb-3 tracking-tight">Something went wrong</h2>
+            <p className="text-sm text-muted-foreground mb-2 leading-relaxed">
+              An unexpected error occurred. Your room code is still valid — reload and re-enter it to continue.
+            </p>
+            <p className="text-xs text-muted-foreground/60 font-mono mb-8 break-all">{this.state.error}</p>
+            <button
+              onClick={() => { this.setState({ error: null }); window.location.href = "/" }}
+              className="px-6 py-3 bg-accent text-white text-sm font-bold hover:opacity-90 transition-opacity"
+            >
+              Go Home
+            </button>
+          </div>
+        </div>
+      )
+    }
+    return this.props.children
+  }
+}
+
 // ─── ANIMATIONS ───────────────────────────────────────────────────────────────
 
 const fadeUp  = { initial:{ opacity:0, y:16 }, animate:{ opacity:1, y:0 }, exit:{ opacity:0, y:-8 } }
@@ -143,55 +180,73 @@ const fadeIn  = { initial:{ opacity:0 }, animate:{ opacity:1 }, exit:{ opacity:0
 const stagger = { animate:{ transition:{ staggerChildren:0.06 } } }
 
 // ─── HOOK: useRoom ────────────────────────────────────────────────────────────
+// Safe version: no side-effects inside setRoom, no .map().join() dep arrays,
+// heartbeat reads from storage directly to avoid Supabase Realtime loops.
 
 const useRoom = (code: string | null) => {
   const [room, setRoom] = useState<Room | null>(null)
-  const myIdRef = useRef<string>()
+  const myIdRef = useRef<string | undefined>(undefined)
+  const codeRef = useRef(code)
+  codeRef.current = code
 
+  // Subscribe to room updates
   useEffect(() => {
     if (!code) return
-    roomDB.get(code).then(d => { if (d) setRoom(d as Room) })
-    const unsub = roomDB.subscribe(code, d => { if (d==null) setRoom(null); else setRoom(d as Room) })
+    // Load initial state
+    roomDB.get(code).then(d => {
+      if (d) setRoom(d as Room)
+    }).catch(() => {})
+
+    // Live subscription
+    const unsub = roomDB.subscribe(code, d => {
+      if (d == null) setRoom(null)
+      else setRoom(d as Room)
+    })
     return unsub
   }, [code])
 
-  // Heartbeat every 8s
-  useEffect(() => {
-    if (!room || !myIdRef.current) return
-    const pid = myIdRef.current
-    const tick = () => setRoom(prev => {
-      if (!prev) return prev
-      const next: Room = { ...prev, players:prev.players.map(p=>p.id===pid?{...p,lastSeen:Date.now()}:p) }
-      roomDB.set(next.code, next)
-      return next
-    })
-    const t = setInterval(tick, 8000)
-    return () => clearInterval(t)
-  }, [!!room, myIdRef.current])
+  // Heartbeat: read → patch lastSeen → write back.
+  // Never calls setRoom inside the interval to avoid Realtime feedback loops.
+  const heartbeat = useCallback((pid: string) => {
+    myIdRef.current = pid
+  }, [])
 
-  // Auto-reassign host if disconnected in lobby
   useEffect(() => {
-    if (!room || room.status !== "waiting") return
-    const host = room.players.find(p => p.isHost)
-    if (!host) return
-    const stale = Date.now() - (host.lastSeen || Date.now()) > 20000
-    if (stale && room.players.length > 1) {
-      const next = room.players.find(p => !p.isHost)
-      if (next && next.id === myIdRef.current) {
-        const updated: Room = { ...room, hostId:next.id, players:room.players.map(p=>({...p,isHost:p.id===next.id})) }
-        roomDB.set(updated.code, updated); setRoom(updated)
-      }
+    if (!code) return
+    const tick = async () => {
+      const pid = myIdRef.current
+      if (!pid || !codeRef.current) return
+      try {
+        const raw = await roomDB.get(codeRef.current)
+        if (!raw) return
+        const r = raw as Room
+        // Only update if this player is actually in the room
+        if (!r.players.find(p => p.id === pid)) return
+        const updated: Room = {
+          ...r,
+          players: r.players.map(p =>
+            p.id === pid ? { ...p, lastSeen: Date.now() } : p
+          ),
+        }
+        roomDB.set(updated.code, updated)
+      } catch {}
     }
-  }, [room?.players.map(p=>p.lastSeen).join(",")])
+    const t = setInterval(tick, 12000)
+    return () => clearInterval(t)
+  }, [code])
 
-  const heartbeat = useCallback((pid: string) => { myIdRef.current = pid }, [])
-
+  // updateRoom: optimistic local update + persist
   const updateRoom = useCallback((updater: (r: Room) => Room) => {
     setRoom(prev => {
       if (!prev) return prev
-      const next = updater(prev)
-      roomDB.set(next.code, next)
-      return next
+      try {
+        const next = updater(prev)
+        roomDB.set(next.code, next)
+        return next
+      } catch (err) {
+        console.error("[updateRoom] failed:", err)
+        return prev
+      }
     })
   }, [])
 
@@ -730,14 +785,50 @@ const LobbyView = ({ roomCode, myPlayerId, onNavigate }: { roomCode:string; myPl
   const baseUrl=`${window.location.protocol}//${window.location.host}${window.location.pathname}`
   const joinUrl=`${baseUrl}?join=${room.code}`
   const doShare=async()=>{ try { await navigator.share({title:"PlayGioco",text:`Join! Code: ${room.code}`,url:joinUrl}) } catch { const ok=doCopy(joinUrl); toast(ok?"Link copied!":"Copy the link above") } }
-  const startGame=()=>{
-    if(!canStart)return
-    const word=pickWord(room.settings.category,room.usedWords)
-    const wr=assignRoles(room.players)
-    const imp=wr.find(p=>p.role==="imposter")!
-    const session: GameSession = { mode:room.mode,word,category:room.settings.category,imposterId:imp.id,gameRound:1,clueRound:1,maxClueRounds:room.settings.rounds,phase:"role-reveal",baseOrder:buildOrder(wr,imp.id),currentSpeakerIndex:0,messages:[],votes:{},continueVotes:{},drawStrokes:[],drawChatMessages:[] }
-    updateRoom(r=>({...r,status:"playing",players:wr,session,usedWords:[...r.usedWords,word]}))
-    onNavigate("role-reveal")
+  const startGame = () => {
+    if (!canStart || !room) return
+    try {
+      const word = pickWord(room.settings.category ?? "Food", room.usedWords ?? [])
+      if (!word) { toast.error("Could not select a word. Try a different category."); return }
+
+      const wr = assignRoles(room.players)
+      const imp = wr.find(p => p.role === "imposter")
+      if (!imp) { toast.error("Role assignment failed. Please try again."); return }
+
+      const order = buildOrder(wr, imp.id)
+      if (!order.length) { toast.error("Could not build speaking order."); return }
+
+      const session: GameSession = {
+        mode: room.mode ?? "find",
+        word,
+        category: room.settings.category ?? "Food",
+        imposterId: imp.id,
+        gameRound: 1,
+        clueRound: 1,
+        maxClueRounds: room.settings.rounds ?? null,
+        phase: "role-reveal",
+        baseOrder: order,
+        currentSpeakerIndex: 0,
+        messages: [],
+        votes: {},
+        continueVotes: {},
+        drawStrokes: [],
+        drawChatMessages: [],
+      }
+
+      updateRoom(r => ({
+        ...r,
+        status: "playing",
+        players: wr,
+        session,
+        usedWords: [...(r.usedWords ?? []), word],
+      }))
+
+      onNavigate("role-reveal")
+    } catch (err) {
+      console.error("[startGame] error:", err)
+      toast.error("Failed to start game. Please try again.")
+    }
   }
   return (
     <motion.div variants={fadeIn} initial="initial" animate="animate" transition={{ duration:0.2 }} className="min-h-screen font-['Inter',_sans-serif] bg-[#F8F8F8]">
@@ -1452,7 +1543,7 @@ export default function App() {
   const selectGame=(mode: GameMode)=>{setSG(mode);setView("create");window.scrollTo({top:0})}
 
   return (
-    <>
+    <ErrorBoundary>
       <Toaster position="top-center" toastOptions={{ style:{background:"#171717",color:"#F8F8F8",border:"none",borderRadius:"0",fontFamily:"Inter,sans-serif",fontSize:"13px"} }}/>
       <div className="font-['Inter',_sans-serif]">
         <AnimatePresence mode="wait">
@@ -1471,6 +1562,6 @@ export default function App() {
           </motion.div>
         </AnimatePresence>
       </div>
-    </>
+    </ErrorBoundary>
   )
 }
