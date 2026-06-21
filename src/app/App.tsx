@@ -180,24 +180,24 @@ const fadeIn  = { initial:{ opacity:0 }, animate:{ opacity:1 }, exit:{ opacity:0
 const stagger = { animate:{ transition:{ staggerChildren:0.06 } } }
 
 // ─── HOOK: useRoom ────────────────────────────────────────────────────────────
-// Safe version: no side-effects inside setRoom, no .map().join() dep arrays,
-// heartbeat reads from storage directly to avoid Supabase Realtime loops.
+// Rules:
+//  1. setRoom callback must be pure — no side effects (no roomDB.set inside it).
+//  2. DB writes happen in a useEffect that watches `room` with a local-write flag.
+//  3. Heartbeat writes directly to DB without touching React state.
 
 const useRoom = (code: string | null) => {
   const [room, setRoom] = useState<Room | null>(null)
-  const myIdRef = useRef<string | undefined>(undefined)
-  const codeRef = useRef(code)
-  codeRef.current = code
+  const myIdRef      = useRef<string | undefined>(undefined)
+  const codeRef      = useRef(code)
+  const localWrite   = useRef(false) // true when WE called updateRoom (not remote)
+  codeRef.current    = code
 
-  // Subscribe to room updates
+  // ── Subscribe to room updates ──────────────────────────────────────────────
   useEffect(() => {
     if (!code) return
-    // Load initial state
-    roomDB.get(code).then(d => {
-      if (d) setRoom(d as Room)
-    }).catch(() => {})
-
-    // Live subscription
+    roomDB.get(code)
+      .then(d => { if (d) setRoom(d as Room) })
+      .catch(() => {})
     const unsub = roomDB.subscribe(code, d => {
       if (d == null) setRoom(null)
       else setRoom(d as Room)
@@ -205,8 +205,17 @@ const useRoom = (code: string | null) => {
     return unsub
   }, [code])
 
-  // Heartbeat: read → patch lastSeen → write back.
-  // Never calls setRoom inside the interval to avoid Realtime feedback loops.
+  // ── Write to DB after a LOCAL state update ─────────────────────────────────
+  // This effect runs after every render where room changes.
+  // Only persists when localWrite flag is set (i.e., WE initiated the update,
+  // not when an update arrived from Supabase/BroadcastChannel).
+  useEffect(() => {
+    if (!room || !localWrite.current) return
+    localWrite.current = false
+    try { roomDB.set(room.code, room) } catch {}
+  }) // intentionally no dep array — runs after every commit
+
+  // ── Heartbeat: write lastSeen without touching React state ─────────────────
   const heartbeat = useCallback((pid: string) => {
     myIdRef.current = pid
   }, [])
@@ -220,30 +229,28 @@ const useRoom = (code: string | null) => {
         const raw = await roomDB.get(codeRef.current)
         if (!raw) return
         const r = raw as Room
-        // Only update if this player is actually in the room
         if (!r.players.find(p => p.id === pid)) return
-        const updated: Room = {
+        roomDB.set(r.code, {
           ...r,
           players: r.players.map(p =>
             p.id === pid ? { ...p, lastSeen: Date.now() } : p
           ),
-        }
-        roomDB.set(updated.code, updated)
+        })
       } catch {}
     }
-    const t = setInterval(tick, 12000)
+    const t = setInterval(tick, 15000)
     return () => clearInterval(t)
   }, [code])
 
-  // updateRoom: optimistic local update + persist
+  // ── updateRoom: pure state update, DB write handled by the effect above ────
   const updateRoom = useCallback((updater: (r: Room) => Room) => {
+    localWrite.current = true // flag BEFORE setRoom so effect sees it
     setRoom(prev => {
       if (!prev) return prev
       try {
-        const next = updater(prev)
-        roomDB.set(next.code, next)
-        return next
+        return updater(prev) // pure — just return new state
       } catch (err) {
+        localWrite.current = false
         console.error("[updateRoom] failed:", err)
         return prev
       }
@@ -1545,21 +1552,69 @@ export default function App() {
   return (
     <ErrorBoundary>
       <Toaster position="top-center" toastOptions={{ style:{background:"#171717",color:"#F8F8F8",border:"none",borderRadius:"0",fontFamily:"Inter,sans-serif",fontSize:"13px"} }}/>
-      <div className="font-['Inter',_sans-serif]">
-        <AnimatePresence mode="wait">
-          <motion.div key={view} variants={fadeIn} initial="initial" animate="animate" exit="exit" transition={{ duration:0.15 }}>
-            {view==="landing"      && <LandingView    onNavigate={navigate} onSelectGame={selectGame}/>}
-            {view==="how-to-play"  && <HowToPlayView  onNavigate={navigate}/>}
-            {view==="create"       && <CreateView     onNavigate={navigate} onEnter={enterRoom} initialMode={selectedGame}/>}
-            {view==="join"         && <JoinView       onNavigate={navigate} onEnter={enterRoom} prefillCode={prefillCode}/>}
-            {view==="lobby"        && roomCode && myPlayerId && <LobbyView      roomCode={roomCode} myPlayerId={myPlayerId} onNavigate={navigate}/>}
-            {view==="role-reveal"  && roomCode && myPlayerId && <RoleRevealView roomCode={roomCode} myPlayerId={myPlayerId} onNavigate={navigate}/>}
-            {view==="game"         && roomCode && myPlayerId && <GameView       roomCode={roomCode} myPlayerId={myPlayerId} onNavigate={navigate}/>}
-            {view==="draw-game"    && roomCode && myPlayerId && <DrawGameView   roomCode={roomCode} myPlayerId={myPlayerId} onNavigate={navigate}/>}
-            {view==="vote"         && roomCode && myPlayerId && <VoteView       roomCode={roomCode} myPlayerId={myPlayerId} onNavigate={navigate}/>}
-            {view==="results"      && roomCode && myPlayerId && <ResultsView    roomCode={roomCode} myPlayerId={myPlayerId} onNavigate={navigate}/>}
-            {view==="stats"        && <StatsView onNavigate={navigate}/>}
-          </motion.div>
+      {/*
+        Each view gets its OWN motion.div with its own key.
+        This prevents the exiting wrapper from re-rendering with the NEW view's
+        state (which caused #310 "Rendered more hooks than during previous render").
+        AnimatePresence without mode="wait" lets enter/exit overlap briefly — safe.
+      */}
+      <div className="font-['Inter',_sans-serif] relative min-h-screen">
+        <AnimatePresence>
+          {view==="landing" && (
+            <motion.div key="landing" {...fadeIn} transition={{ duration:0.15 }} style={{ position:"absolute", inset:0, minHeight:"100vh" }}>
+              <LandingView onNavigate={navigate} onSelectGame={selectGame}/>
+            </motion.div>
+          )}
+          {view==="how-to-play" && (
+            <motion.div key="how-to-play" {...fadeIn} transition={{ duration:0.15 }} style={{ position:"absolute", inset:0, minHeight:"100vh" }}>
+              <HowToPlayView onNavigate={navigate}/>
+            </motion.div>
+          )}
+          {view==="create" && (
+            <motion.div key="create" {...fadeIn} transition={{ duration:0.15 }} style={{ position:"absolute", inset:0, minHeight:"100vh" }}>
+              <CreateView onNavigate={navigate} onEnter={enterRoom} initialMode={selectedGame}/>
+            </motion.div>
+          )}
+          {view==="join" && (
+            <motion.div key="join" {...fadeIn} transition={{ duration:0.15 }} style={{ position:"absolute", inset:0, minHeight:"100vh" }}>
+              <JoinView onNavigate={navigate} onEnter={enterRoom} prefillCode={prefillCode}/>
+            </motion.div>
+          )}
+          {view==="stats" && (
+            <motion.div key="stats" {...fadeIn} transition={{ duration:0.15 }} style={{ position:"absolute", inset:0, minHeight:"100vh" }}>
+              <StatsView onNavigate={navigate}/>
+            </motion.div>
+          )}
+          {view==="lobby" && roomCode && myPlayerId && (
+            <motion.div key="lobby" {...fadeIn} transition={{ duration:0.15 }} style={{ position:"absolute", inset:0, minHeight:"100vh" }}>
+              <LobbyView roomCode={roomCode} myPlayerId={myPlayerId} onNavigate={navigate}/>
+            </motion.div>
+          )}
+          {view==="role-reveal" && roomCode && myPlayerId && (
+            <motion.div key="role-reveal" {...fadeIn} transition={{ duration:0.15 }} style={{ position:"absolute", inset:0, minHeight:"100vh" }}>
+              <RoleRevealView roomCode={roomCode} myPlayerId={myPlayerId} onNavigate={navigate}/>
+            </motion.div>
+          )}
+          {view==="game" && roomCode && myPlayerId && (
+            <motion.div key="game" {...fadeIn} transition={{ duration:0.15 }} style={{ position:"absolute", inset:0, minHeight:"100vh" }}>
+              <GameView roomCode={roomCode} myPlayerId={myPlayerId} onNavigate={navigate}/>
+            </motion.div>
+          )}
+          {view==="draw-game" && roomCode && myPlayerId && (
+            <motion.div key="draw-game" {...fadeIn} transition={{ duration:0.15 }} style={{ position:"absolute", inset:0, minHeight:"100vh" }}>
+              <DrawGameView roomCode={roomCode} myPlayerId={myPlayerId} onNavigate={navigate}/>
+            </motion.div>
+          )}
+          {view==="vote" && roomCode && myPlayerId && (
+            <motion.div key="vote" {...fadeIn} transition={{ duration:0.15 }} style={{ position:"absolute", inset:0, minHeight:"100vh" }}>
+              <VoteView roomCode={roomCode} myPlayerId={myPlayerId} onNavigate={navigate}/>
+            </motion.div>
+          )}
+          {view==="results" && roomCode && myPlayerId && (
+            <motion.div key="results" {...fadeIn} transition={{ duration:0.15 }} style={{ position:"absolute", inset:0, minHeight:"100vh" }}>
+              <ResultsView roomCode={roomCode} myPlayerId={myPlayerId} onNavigate={navigate}/>
+            </motion.div>
+          )}
         </AnimatePresence>
       </div>
     </ErrorBoundary>
